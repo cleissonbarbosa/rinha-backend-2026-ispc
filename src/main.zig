@@ -219,6 +219,30 @@ fn workerMain(server: *std.net.Server) void {
     };
 }
 
+fn listenTcpServer(port: u16) !std.net.Server {
+    const address = std.net.Address.parseIp4("0.0.0.0", port) catch unreachable;
+    return address.listen(.{
+        .reuse_address = true,
+        .kernel_backlog = 4096,
+    });
+}
+
+fn listenUnixServer(socket_path: []const u8) !std.net.Server {
+    if (std.fs.path.dirname(socket_path)) |socket_dir| {
+        try std.fs.cwd().makePath(socket_dir);
+    }
+
+    std.fs.deleteFileAbsolute(socket_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const address = try std.net.Address.initUnix(socket_path);
+    return address.listen(.{
+        .kernel_backlog = 4096,
+    });
+}
+
 pub fn main() !void {
     profiler.initFromEnv();
 
@@ -226,6 +250,7 @@ pub fn main() !void {
         const port_str = std.posix.getenv("PORT") orelse "8080";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 8080;
     };
+    const socket_path = std.posix.getenv("SOCKET_PATH");
     const data_dir = std.posix.getenv("DATA_DIR") orelse "/data";
     const worker_count = blk: {
         const worker_str = std.posix.getenv("HTTP_THREADS") orelse "4";
@@ -233,7 +258,11 @@ pub fn main() !void {
         break :blk @max(parsed, 1);
     };
 
-    std.log.info("Starting rinha-server on port {d}, data_dir={s}, workers={d}", .{ port, data_dir, worker_count });
+    if (socket_path) |path| {
+        std.log.info("Starting rinha-server on socket {s}, data_dir={s}, workers={d}", .{ path, data_dir, worker_count });
+    } else {
+        std.log.info("Starting rinha-server on port {d}, data_dir={s}, workers={d}", .{ port, data_dir, worker_count });
+    }
 
     // Load preprocessed data
     loadData(data_dir) catch |err| {
@@ -242,14 +271,20 @@ pub fn main() !void {
     };
 
     ready = true;
-    std.log.info("Server ready on port {d}", .{port});
+    if (socket_path) |path| {
+        std.log.info("Server ready on socket {s}", .{path});
+    } else {
+        std.log.info("Server ready on port {d}", .{port});
+    }
 
-    const address = std.net.Address.parseIp4("0.0.0.0", port) catch unreachable;
-    var server = try address.listen(.{
-        .reuse_address = true,
-        .kernel_backlog = 4096,
-    });
+    var server = if (socket_path) |path|
+        try listenUnixServer(path)
+    else
+        try listenTcpServer(port);
     defer server.deinit();
+    defer if (socket_path) |path| {
+        std.fs.deleteFileAbsolute(path) catch {};
+    };
 
     var spawned_threads: usize = 1;
     while (spawned_threads < worker_count) : (spawned_threads += 1) {
