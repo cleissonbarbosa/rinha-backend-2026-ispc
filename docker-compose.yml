@@ -13,13 +13,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.25"
           memory: "50MB"
     networks:
       - rinha
 
   api1:
-    build: .
     image: cleissonb/rinha-backend-2026-ispc:latest
     hostname: api1
     environment:
@@ -29,13 +28,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.375"
           memory: "150MB"
     networks:
       - rinha
 
   api2:
-    build: .
     image: cleissonb/rinha-backend-2026-ispc:latest
     hostname: api2
     environment:
@@ -45,7 +43,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.375"
           memory: "150MB"
     networks:
       - rinha
