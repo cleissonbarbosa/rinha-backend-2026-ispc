@@ -2,18 +2,24 @@ const std = @import("std");
 const vectorize = @import("vectorize.zig");
 
 const Payload = vectorize.Payload;
+const Scope = enum {
+    root,
+    transaction,
+    customer,
+    merchant,
+    terminal,
+    last_transaction,
+};
 
 pub fn parse(json: []const u8) ?Payload {
     var p = Payload{};
     var i: usize = 0;
-    var in_last_transaction = false;
-    var last_tx_null = true;
+    var scope: Scope = .root;
 
     while (i < json.len) {
         if (json[i] == '"') {
-            const key_start = i + 1;
-            const key_end = findChar(json, key_start, '"') orelse break;
-            const key = json[key_start..key_end];
+            const key_end = findChar(json, i + 1, '"') orelse break;
+            const key = json[i + 1 .. key_end];
             i = key_end + 1;
 
             i = skipWhitespace(json, i);
@@ -24,106 +30,121 @@ pub fn parse(json: []const u8) ?Payload {
             i += 1;
             i = skipWhitespace(json, i);
 
-            if (std.mem.eql(u8, key, "last_transaction")) {
-                if (i < json.len and json[i] == 'n') {
-                    in_last_transaction = false;
-                    last_tx_null = true;
-                    p.has_last_tx = false;
-                    i += 4;
-                    continue;
-                } else if (i < json.len and json[i] == '{') {
-                    in_last_transaction = true;
-                    last_tx_null = false;
+            if (i < json.len and json[i] == '{') {
+                scope = if (std.mem.eql(u8, key, "transaction"))
+                    .transaction
+                else if (std.mem.eql(u8, key, "customer"))
+                    .customer
+                else if (std.mem.eql(u8, key, "merchant"))
+                    .merchant
+                else if (std.mem.eql(u8, key, "terminal"))
+                    .terminal
+                else if (std.mem.eql(u8, key, "last_transaction")) blk: {
                     p.has_last_tx = true;
-                    i += 1;
-                    continue;
-                }
+                    break :blk .last_transaction;
+                } else scope;
+                i += 1;
+                continue;
             }
 
-            if (in_last_transaction) {
-                if (std.mem.eql(u8, key, "timestamp")) {
-                    if (extractString(json, i)) |s| {
-                        p.last_tx_timestamp = s.val;
-                        i = s.end;
+            if (std.mem.eql(u8, key, "last_transaction") and i < json.len and json[i] == 'n') {
+                scope = .root;
+                p.has_last_tx = false;
+                i += 4;
+                continue;
+            }
+
+            switch (scope) {
+                .transaction => {
+                    if (std.mem.eql(u8, key, "amount")) {
+                        if (extractNumber(json, i)) |n| {
+                            p.amount = n.val;
+                            i = n.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "installments")) {
+                        if (extractNumber(json, i)) |n| {
+                            p.installments = n.val;
+                            i = n.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "requested_at")) {
+                        if (extractString(json, i)) |s| {
+                            p.requested_at = s.val;
+                            i = s.end;
+                        }
                     }
-                } else if (std.mem.eql(u8, key, "km_from_current")) {
-                    if (extractNumber(json, i)) |n| {
-                        p.km_from_current = n.val;
-                        i = n.end;
-                    }
-                }
-            } else {
-                if (std.mem.eql(u8, key, "amount")) {
-                    if (extractNumber(json, i)) |n| {
-                        p.amount = n.val;
-                        i = n.end;
-                    }
-                } else if (std.mem.eql(u8, key, "installments")) {
-                    if (extractNumber(json, i)) |n| {
-                        p.installments = n.val;
-                        i = n.end;
-                    }
-                } else if (std.mem.eql(u8, key, "requested_at")) {
-                    if (extractString(json, i)) |s| {
-                        p.requested_at = s.val;
-                        i = s.end;
-                    }
-                } else if (std.mem.eql(u8, key, "avg_amount")) {
-                    if (extractNumber(json, i)) |n| {
-                        if (p.merchant_id.len > 0) {
-                            p.merchant_avg_amount = n.val;
-                        } else {
+                },
+                .customer => {
+                    if (std.mem.eql(u8, key, "avg_amount")) {
+                        if (extractNumber(json, i)) |n| {
                             p.avg_amount = n.val;
+                            i = n.end;
                         }
-                        i = n.end;
+                    } else if (std.mem.eql(u8, key, "tx_count_24h")) {
+                        if (extractNumber(json, i)) |n| {
+                            p.tx_count_24h = n.val;
+                            i = n.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "known_merchants")) {
+                        i = parseStringArray(json, i, &p.known_merchants, &p.known_merchants_count);
                     }
-                } else if (std.mem.eql(u8, key, "tx_count_24h")) {
-                    if (extractNumber(json, i)) |n| {
-                        p.tx_count_24h = n.val;
-                        i = n.end;
-                    }
-                } else if (std.mem.eql(u8, key, "known_merchants")) {
-                    i = parseStringArray(json, i, &p.known_merchants, &p.known_merchants_count);
-                } else if (std.mem.eql(u8, key, "id")) {
-                    if (extractString(json, i)) |s| {
-                        if (lookBackForKey(json, key_start, "merchant")) {
+                },
+                .merchant => {
+                    if (std.mem.eql(u8, key, "id")) {
+                        if (extractString(json, i)) |s| {
                             p.merchant_id = s.val;
+                            i = s.end;
                         }
-
-                        i = s.end;
+                    } else if (std.mem.eql(u8, key, "mcc")) {
+                        if (extractString(json, i)) |s| {
+                            p.mcc = s.val;
+                            i = s.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "avg_amount")) {
+                        if (extractNumber(json, i)) |n| {
+                            p.merchant_avg_amount = n.val;
+                            i = n.end;
+                        }
                     }
-                } else if (std.mem.eql(u8, key, "mcc")) {
-                    if (extractString(json, i)) |s| {
-                        p.mcc = s.val;
-                        i = s.end;
+                },
+                .terminal => {
+                    if (std.mem.eql(u8, key, "is_online")) {
+                        if (extractBool(json, i)) |b| {
+                            p.is_online = b.val;
+                            i = b.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "card_present")) {
+                        if (extractBool(json, i)) |b| {
+                            p.card_present = b.val;
+                            i = b.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "km_from_home")) {
+                        if (extractNumber(json, i)) |n| {
+                            p.km_from_home = n.val;
+                            i = n.end;
+                        }
                     }
-                } else if (std.mem.eql(u8, key, "is_online")) {
-                    if (extractBool(json, i)) |b| {
-                        p.is_online = b.val;
-                        i = b.end;
+                },
+                .last_transaction => {
+                    if (std.mem.eql(u8, key, "timestamp")) {
+                        if (extractString(json, i)) |s| {
+                            p.last_tx_timestamp = s.val;
+                            i = s.end;
+                        }
+                    } else if (std.mem.eql(u8, key, "km_from_current")) {
+                        if (extractNumber(json, i)) |n| {
+                            p.km_from_current = n.val;
+                            i = n.end;
+                        }
                     }
-                } else if (std.mem.eql(u8, key, "card_present")) {
-                    if (extractBool(json, i)) |b| {
-                        p.card_present = b.val;
-                        i = b.end;
-                    }
-                } else if (std.mem.eql(u8, key, "km_from_home")) {
-                    if (extractNumber(json, i)) |n| {
-                        p.km_from_home = n.val;
-                        i = n.end;
-                    }
-                }
+                },
+                .root => {},
             }
-        } else if (json[i] == '}' and in_last_transaction) {
-            in_last_transaction = false;
+        } else if (json[i] == '}' and scope != .root) {
+            scope = .root;
             i += 1;
         } else {
             i += 1;
         }
-    }
-
-    if (!last_tx_null) {
-        p.has_last_tx = true;
     }
 
     return p;
@@ -133,13 +154,50 @@ const NumberResult = struct { val: f64, end: usize };
 const StringResult = struct { val: []const u8, end: usize };
 const BoolResult = struct { val: bool, end: usize };
 
+fn parseSimpleNumber(num: []const u8) ?f64 {
+    if (num.len == 0) return null;
+
+    var i: usize = 0;
+    var negative = false;
+    if (num[i] == '-') {
+        negative = true;
+        i += 1;
+    } else if (num[i] == '+') {
+        i += 1;
+    }
+
+    if (i >= num.len) return null;
+
+    var value: f64 = 0.0;
+    var saw_digit = false;
+    while (i < num.len and num[i] >= '0' and num[i] <= '9') : (i += 1) {
+        saw_digit = true;
+        value = value * 10.0 + @as(f64, @floatFromInt(num[i] - '0'));
+    }
+
+    if (i < num.len and num[i] == '.') {
+        i += 1;
+        var scale: f64 = 0.1;
+        while (i < num.len and num[i] >= '0' and num[i] <= '9') : (i += 1) {
+            saw_digit = true;
+            value += @as(f64, @floatFromInt(num[i] - '0')) * scale;
+            scale *= 0.1;
+        }
+    }
+
+    if (!saw_digit or i != num.len) return null;
+    return if (negative) -value else value;
+}
+
 fn extractNumber(json: []const u8, start: usize) ?NumberResult {
     var i = skipWhitespace(json, start);
     const num_start = i;
+    var has_exponent = false;
 
     while (i < json.len) {
         const c = json[i];
         if ((c >= '0' and c <= '9') or c == '.' or c == '-' or c == '+' or c == 'e' or c == 'E') {
+            if (c == 'e' or c == 'E') has_exponent = true;
             i += 1;
         } else {
             break;
@@ -148,7 +206,11 @@ fn extractNumber(json: []const u8, start: usize) ?NumberResult {
 
     if (i == num_start) return null;
 
-    const val = std.fmt.parseFloat(f64, json[num_start..i]) catch return null;
+    const num = json[num_start..i];
+    const val = if (has_exponent)
+        std.fmt.parseFloat(f64, num) catch return null
+    else
+        parseSimpleNumber(num) orelse return null;
     return NumberResult{ .val = val, .end = i };
 }
 
@@ -203,41 +265,6 @@ fn parseStringArray(json: []const u8, start: usize, out: *[32][]const u8, count:
     }
     count.* = c;
     return i;
-}
-
-fn lookBackForKey(json: []const u8, pos: usize, key: []const u8) bool {
-    if (pos < key.len + 5) return false;
-    var i = pos - 1;
-
-    var depth: i32 = 0;
-    var found_brace = false;
-    while (i > 0) : (i -= 1) {
-        const c = json[i];
-        if (c == '{') {
-            found_brace = true;
-            break;
-        }
-        if (c == '}') {
-            depth += 1;
-        }
-        if (depth > 0) continue;
-        if (i < key.len + 3) return false;
-    }
-    if (!found_brace or i < key.len + 3) return false;
-
-    var j = i;
-    while (j > 0) : (j -= 1) {
-        if (json[j] == '"') {
-            const end = j;
-            if (j < key.len) return false;
-            const start = end - key.len;
-            if (start > 0 and json[start - 1] == '"') {
-                return std.mem.eql(u8, json[start..end], key);
-            }
-            return false;
-        }
-    }
-    return false;
 }
 
 fn findChar(json: []const u8, start: usize, char: u8) ?usize {
@@ -335,4 +362,16 @@ test "parse null last_transaction" {
     const p = parse(json) orelse unreachable;
     try std.testing.expect(!p.has_last_tx);
     try std.testing.expectApproxEqAbs(@as(f64, 41.12), p.amount, 0.01);
+}
+
+test "extractNumber fast path decimal" {
+    const result = extractNumber(" 384.88,", 0) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 384.88), result.val, 0.0001);
+    try std.testing.expectEqual(@as(usize, 7), result.end);
+}
+
+test "extractNumber exponent fallback" {
+    const result = extractNumber("1.25e2}", 0) orelse unreachable;
+    try std.testing.expectApproxEqAbs(@as(f64, 125.0), result.val, 0.0001);
+    try std.testing.expectEqual(@as(usize, 6), result.end);
 }
