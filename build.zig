@@ -11,9 +11,11 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseFast,
     });
     const ispc_object = b.option([]const u8, "ispc-object", "Path to a compiled ISPC object file");
+    const enable_profiler = b.option(bool, "enable_profiler", "Compile runtime profiler instrumentation") orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_ispc", ispc_object != null);
+    build_options.addOption(bool, "enable_profiler", enable_profiler);
 
     const exe = b.addExecutable(.{
         .name = "rinha-server",

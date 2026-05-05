@@ -1,4 +1,4 @@
-.PHONY: build up down smoke test logs
+.PHONY: build up down smoke test logs profile
 
 build:
 	docker compose build --no-cache
@@ -20,6 +20,11 @@ smoke:
 
 logs:
 	docker compose logs -f --tail=100
+
+profile:
+	ENABLE_PROFILER=1 PROFILE=1 PROFILE_LOG_EVERY=$${PROFILE_LOG_EVERY:-5000} docker compose up -d --build
+	sh scripts/official-test.sh full
+	docker compose logs --tail=200 api1 api2
 
 docker/clean:
 	docker compose down --remove-orphans --rmi all --volumes

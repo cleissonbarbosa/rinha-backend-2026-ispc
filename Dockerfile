@@ -31,6 +31,7 @@ ARG IVF_NPROBE=8
 ARG IVF_SAMPLE=65536
 ARG IVF_ITERATIONS=25
 ARG USE_LOCAL_DATA=1
+ARG ENABLE_PROFILER=0
 
 WORKDIR /build
 
@@ -79,7 +80,12 @@ COPY build.zig .
 COPY src/ src/
 COPY --from=ispc-builder /build/knn_ispc.o /tmp/knn_ispc.o
 
-RUN zig build --release=fast -Dcpu=haswell -Dispc-object=/tmp/knn_ispc.o 2>&1 && \
+RUN set -eu; \
+    build_args="--release=fast -Dcpu=haswell -Dispc-object=/tmp/knn_ispc.o"; \
+    if [ "${ENABLE_PROFILER}" = "1" ]; then \
+        build_args="$build_args -Denable_profiler=true"; \
+    fi; \
+    zig build $build_args 2>&1 && \
     ls -la zig-out/bin/
 
 FROM alpine:3.20

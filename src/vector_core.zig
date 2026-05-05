@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const profiler = @import("profiler.zig");
 const posix = std.posix;
 
 const D: usize = 14;
@@ -21,7 +22,6 @@ const COARSE_TIE_GAP: f32 = 512.0;
 
 const Vec32 = @Vector(AVX2_LANES, f32);
 const Vec16 = @Vector(AVX2_LANES, i16);
-
 comptime {
     std.debug.assert(VLEN == AVX2_LANES * 2);
     _ = builtin;
@@ -184,6 +184,15 @@ inline fn lowerBoundSq(centroid_sq_dist: f32, radius: f32) f32 {
     return delta * delta;
 }
 
+inline fn countTopFrauds(labels_ptr: [*]const u8, top_dist: *const [TOP_C]f32, top_idx: *const [TOP_C]u32, limit: usize) c_int {
+    var fraud_count: c_int = 0;
+    var i: usize = 0;
+    while (i < limit and top_dist.*[i] != std.math.inf(f32)) : (i += 1) {
+        if (labels_ptr[top_idx.*[i]] != 0) fraud_count += 1;
+    }
+    return fraud_count;
+}
+
 inline fn scanRangeZig(query: *const [D]f32, start: usize, end: usize, top_dist: *[TOP_C]f32, top_idx: *[TOP_C]u32) void {
     const dims_ptr = dims_data;
     const n = n_vecs;
@@ -337,6 +346,7 @@ inline fn refRefined(idx: usize, dim: usize) i32 {
 pub export fn vc_query(query_ptr: [*]const f32) c_int {
     if (n_vecs == 0) return 0;
 
+    var query_scope = profiler.Scope.start();
     var query: [D]f32 = undefined;
     var query_q16: [D]i16 = undefined;
     var queryRefined: [D]i32 = undefined;
@@ -349,6 +359,7 @@ pub export fn vc_query(query_ptr: [*]const f32) c_int {
             query_q16[i] = @intCast(q16);
         }
     }
+    query_scope.lap(.query_quantize);
 
     var top_dist = [_]f32{std.math.inf(f32)} ** TOP_C;
     var top_idx = [_]u32{0} ** TOP_C;
@@ -415,31 +426,48 @@ pub export fn vc_query(query_ptr: [*]const f32) c_int {
             insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c), dist);
         }
     }
+    query_scope.lap(.query_centroids);
 
     var p: usize = 0;
+    var seed_vectors: u64 = 0;
     while (p < probe_count) : (p += 1) {
         const cluster_id: usize = @intCast(probe_idx[p]);
         probed[cluster_id] = true;
         const start: usize = @intCast(boundaries_ptr[cluster_id]);
         const end: usize = @intCast(boundaries_ptr[cluster_id + 1]);
+        seed_vectors += end - start;
         scanRange(&query, &query_q16, start, end, &top_dist, &top_idx);
     }
+    profiler.addCounter(.seed_clusters, probe_count);
+    profiler.addCounter(.seed_vectors, seed_vectors);
+    query_scope.lap(.query_seed_scan);
 
-    var expanded = true;
-    while (expanded) {
-        expanded = false;
-        const tau = top_dist[TOP_C - 1];
-        c = 0;
-        while (c < cluster_count) : (c += 1) {
-            if (probed[c]) continue;
-            if (lowerBoundSq(centroid_dist[c], radii_ptr[c]) >= tau) continue;
-            probed[c] = true;
-            const start: usize = @intCast(boundaries_ptr[c]);
-            const end: usize = @intCast(boundaries_ptr[c + 1]);
-            scanRange(&query, &query_q16, start, end, &top_dist, &top_idx);
-            expanded = true;
+    var expanded_clusters: u64 = 0;
+    var expanded_vectors: u64 = 0;
+    const seed_fraud_count = countTopFrauds(labels_ptr, &top_dist, &top_idx, K);
+    const needs_expansion = top_dist[K - 1] == std.math.inf(f32) or (seed_fraud_count != 0 and seed_fraud_count != K);
+    if (needs_expansion) {
+        var expanded = true;
+        while (expanded) {
+            expanded = false;
+            const tau = top_dist[TOP_C - 1];
+            c = 0;
+            while (c < cluster_count) : (c += 1) {
+                if (probed[c]) continue;
+                if (lowerBoundSq(centroid_dist[c], radii_ptr[c]) >= tau) continue;
+                probed[c] = true;
+                const start: usize = @intCast(boundaries_ptr[c]);
+                const end: usize = @intCast(boundaries_ptr[c + 1]);
+                expanded_clusters += 1;
+                expanded_vectors += end - start;
+                scanRange(&query, &query_q16, start, end, &top_dist, &top_idx);
+                expanded = true;
+            }
         }
     }
+    profiler.addCounter(.expanded_clusters, expanded_clusters);
+    profiler.addCounter(.expanded_vectors, expanded_vectors);
+    query_scope.lap(.query_expansion);
 
     if (TOP_C > K and top_dist[K] - top_dist[K - 1] <= COARSE_TIE_GAP) {
         var fraud_count: c_int = 0;
@@ -447,6 +475,9 @@ pub export fn vc_query(query_ptr: [*]const f32) c_int {
         while (k < K) : (k += 1) {
             if (labels_ptr[top_idx[k]] != 0) fraud_count += 1;
         }
+        profiler.incrementCounter(.coarse_shortcuts);
+        query_scope.lap(.query_vote);
+        query_scope.finish(.query_total);
         return fraud_count;
     }
 
@@ -463,11 +494,15 @@ pub export fn vc_query(query_ptr: [*]const f32) c_int {
         }
         insertRefined(&refined_dist, &refined_idx, top_idx[candidate], dist);
     }
+    profiler.addCounter(.refined_candidates, candidate);
+    query_scope.lap(.query_refine);
 
     var fraud_count: c_int = 0;
     var k: usize = 0;
     while (k < K) : (k += 1) {
         if (labels_ptr[refined_idx[k]] != 0) fraud_count += 1;
     }
+    query_scope.lap(.query_vote);
+    query_scope.finish(.query_total);
     return fraud_count;
 }

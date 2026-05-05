@@ -1,5 +1,6 @@
 const std = @import("std");
 const json_fast = @import("json_fast.zig");
+const profiler = @import("profiler.zig");
 const vectorize = @import("vectorize.zig");
 const vector_core = @import("vector_core.zig");
 
@@ -137,6 +138,7 @@ fn routeRequest(request: []const u8) Route {
 fn handleConnection(stream: std.net.Stream) void {
     defer stream.close();
 
+    var request_scope = profiler.Scope.start();
     var recv_buf: [RECV_BUF_SIZE]u8 = undefined;
 
     const request = switch (readRequest(stream, &recv_buf)) {
@@ -153,7 +155,7 @@ fn handleConnection(stream: std.net.Stream) void {
             writeResponse(stream, if (ready) RESP_OK else RESP_503);
         },
         .fraud_score => {
-            handleFraudScore(request, stream);
+            handleFraudScore(request, stream, &request_scope);
         },
         .unknown => {
             writeResponse(stream, RESP_404);
@@ -161,26 +163,38 @@ fn handleConnection(stream: std.net.Stream) void {
     }
 }
 
-fn handleFraudScore(request: []const u8, stream: std.net.Stream) void {
+fn finishFraudResponse(stream: std.net.Stream, response: []const u8, request_scope: *profiler.Scope) void {
+    writeResponse(stream, response);
+    request_scope.lap(.write_response);
+    request_scope.finish(.fraud_total);
+}
+
+fn handleFraudScore(request: []const u8, stream: std.net.Stream, request_scope: *profiler.Scope) void {
+    request_scope.lap(.read_request);
+
     const body = findBody(request) orelse {
-        writeResponse(stream, RESP_FALLBACK);
+        request_scope.lap(.find_body);
+        finishFraudResponse(stream, RESP_FALLBACK, request_scope);
         return;
     };
+    request_scope.lap(.find_body);
 
-    // Parse JSON
     const payload = json_fast.parse(body) orelse {
-        writeResponse(stream, RESP_FALLBACK);
+        request_scope.lap(.parse_json);
+        finishFraudResponse(stream, RESP_FALLBACK, request_scope);
         return;
     };
+    request_scope.lap(.parse_json);
 
-    // Vectorize
     const query_vec = vectorize.vectorize(&payload);
+    request_scope.lap(.vectorize);
 
     const max_score: c_int = @intCast(RESP_FRAUD_SCORES.len);
     const raw_count = vector_core.vc_query(query_vec[0..].ptr);
     const fraud_count: usize = if (raw_count < 0 or raw_count >= max_score) 0 else @intCast(raw_count);
+    request_scope.lap(.core_query);
 
-    writeResponse(stream, RESP_FRAUD_SCORES[fraud_count]);
+    finishFraudResponse(stream, RESP_FRAUD_SCORES[fraud_count], request_scope);
 }
 
 fn findBody(request: []const u8) ?[]const u8 {
@@ -206,6 +220,8 @@ fn workerMain(server: *std.net.Server) void {
 }
 
 pub fn main() !void {
+    profiler.initFromEnv();
+
     const port: u16 = blk: {
         const port_str = std.posix.getenv("PORT") orelse "8080";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 8080;

@@ -19,13 +19,18 @@ services:
       - rinha
 
   api1:
-    build: .
-    image: cleissonb/rinha-backend-2026-ispc:latest
+    build:
+      context: .
+      args:
+        ENABLE_PROFILER: ${ENABLE_PROFILER:-0}
+    image: cleissonb/rinha-backend-2026-ispc:v0.1.0
     hostname: api1
     environment:
       - PORT=8080
       - HTTP_THREADS=2
       - INSTANCE=api1
+      - PROFILE=${PROFILE:-0}
+      - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
     deploy:
       resources:
         limits:
@@ -35,13 +40,18 @@ services:
       - rinha
 
   api2:
-    build: .
-    image: cleissonb/rinha-backend-2026-ispc:latest
+    build:
+      context: .
+      args:
+        ENABLE_PROFILER: ${ENABLE_PROFILER:-0}
+    image: cleissonb/rinha-backend-2026-ispc:v0.1.0
     hostname: api2
     environment:
       - PORT=8080
       - HTTP_THREADS=2
       - INSTANCE=api2
+      - PROFILE=${PROFILE:-0}
+      - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
     deploy:
       resources:
         limits:
