@@ -1,0 +1,8 @@
+.zig*
+.mypy*
+*.log
+test/
+bin/
+resources/*.gz
+resources/references.json
+data/

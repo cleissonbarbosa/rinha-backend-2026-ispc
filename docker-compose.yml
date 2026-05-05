@@ -1,0 +1,53 @@
+services:
+  lb:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9999:9999"
+    depends_on:
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "50MB"
+    networks:
+      - rinha
+
+  api1:
+    build: .
+    hostname: api1
+    environment:
+      - PORT=8080
+      - HTTP_THREADS=2
+      - INSTANCE=api1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "150MB"
+    networks:
+      - rinha
+
+  api2:
+    build: .
+    hostname: api2
+    environment:
+      - PORT=8080
+      - HTTP_THREADS=2
+      - INSTANCE=api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "150MB"
+    networks:
+      - rinha
+
+networks:
+  rinha:
+    driver: bridge
