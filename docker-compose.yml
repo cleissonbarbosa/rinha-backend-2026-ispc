@@ -1,6 +1,6 @@
 services:
   lb:
-    image: haproxy:2.9-alpine
+    image: haproxy:3.3-alpine
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets
@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.40"
           memory: "50MB"
     networks:
       - rinha
@@ -22,11 +22,12 @@ services:
   api1:
     image: cleissonb/rinha-backend-2026-ispc:v0.1.2
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
+    pull_policy: always
     hostname: api1
     environment:
       - PORT=8080
       - SOCKET_PATH=/sockets/api1.sock
-      - HTTP_THREADS=2
+      - HTTP_THREADS=1
       - INSTANCE=api1
       - PROFILE=${PROFILE:-0}
       - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
@@ -35,7 +36,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.30"
           memory: "150MB"
     networks:
       - rinha
@@ -44,10 +45,11 @@ services:
     image: cleissonb/rinha-backend-2026-ispc:v0.1.2
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api2
+    pull_policy: always
     environment:
       - PORT=8080
       - SOCKET_PATH=/sockets/api2.sock
-      - HTTP_THREADS=2
+      - HTTP_THREADS=1
       - INSTANCE=api2
       - PROFILE=${PROFILE:-0}
       - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
@@ -56,7 +58,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.30"
           memory: "150MB"
     networks:
       - rinha
