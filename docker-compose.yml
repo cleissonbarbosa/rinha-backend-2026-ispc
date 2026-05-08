@@ -6,6 +6,12 @@ services:
       - sockets:/sockets
     ports:
       - "9999:9999"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
     depends_on:
       api1:
         condition: service_started
@@ -14,7 +20,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.20"
           memory: "50MB"
     networks:
       - rinha
@@ -26,16 +32,22 @@ services:
     environment:
       - PORT=8080
       - SOCKET_PATH=/sockets/api1.sock
-      - HTTP_THREADS=2
+      - HTTP_THREADS=1
       - INSTANCE=api1
       - PROFILE=${PROFILE:-0}
       - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
     volumes:
       - sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.40"
           memory: "150MB"
     networks:
       - rinha
@@ -47,16 +59,22 @@ services:
     environment:
       - PORT=8080
       - SOCKET_PATH=/sockets/api2.sock
-      - HTTP_THREADS=2
+      - HTTP_THREADS=1
       - INSTANCE=api2
       - PROFILE=${PROFILE:-0}
       - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
     volumes:
       - sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.40"
           memory: "150MB"
     networks:
       - rinha
