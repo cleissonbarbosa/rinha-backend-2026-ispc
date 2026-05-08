@@ -1,6 +1,6 @@
 services:
   lb:
-    image: haproxy:2.9-alpine
+    image: haproxy:3.3.9-alpine
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets
@@ -20,7 +20,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.30"
           memory: "50MB"
     networks:
       - rinha
@@ -47,7 +47,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.35"
           memory: "150MB"
     networks:
       - rinha
@@ -74,7 +74,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.35"
           memory: "150MB"
     networks:
       - rinha
