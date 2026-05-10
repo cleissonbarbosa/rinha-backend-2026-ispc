@@ -1,38 +1,43 @@
 services:
   lb:
-    image: haproxy:3.3.9-alpine
+    image: cleissonb/rinha-backend-2026-ispc-lb:v0.1.8
+    environment:
+      BACKEND1: unix:/sockets/api1.sock
+      BACKEND2: unix:/sockets/api2.sock
+      LB_ADDR: 0.0.0.0
+      LB_PORT: "9999"
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets
     ports:
       - "9999:9999"
+    depends_on:
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
     security_opt:
       - seccomp:unconfined
-    depends_on:
-      api1:
-        condition: service_started
-      api2:
-        condition: service_started
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.40"
           memory: "50MB"
     networks:
       - rinha
 
   api1:
-    image: cleissonb/rinha-backend-2026-ispc:v0.1.5
+    image: cleissonb/rinha-backend-2026-ispc:v0.1.8
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api1
     environment:
       - PORT=8080
       - SOCKET_PATH=/sockets/api1.sock
       - HTTP_THREADS=1
+      - IO_BACKEND=uring
       - INSTANCE=api1
       - PROFILE=${PROFILE:-0}
       - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
@@ -47,19 +52,20 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.30"
           memory: "150MB"
     networks:
       - rinha
 
   api2:
-    image: cleissonb/rinha-backend-2026-ispc:v0.1.5
+    image: cleissonb/rinha-backend-2026-ispc:v0.1.8
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api2
     environment:
       - PORT=8080
       - SOCKET_PATH=/sockets/api2.sock
       - HTTP_THREADS=1
+      - IO_BACKEND=uring
       - INSTANCE=api2
       - PROFILE=${PROFILE:-0}
       - PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY:-10000}
@@ -74,7 +80,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.30"
           memory: "150MB"
     networks:
       - rinha
