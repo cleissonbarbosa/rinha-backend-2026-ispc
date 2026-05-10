@@ -4,7 +4,7 @@ build:
 	docker compose build --no-cache
 
 up:
-	docker compose --compatibility up -d
+	docker compose --compatibility up -d --build
 
 down:
 	docker compose down --remove-orphans

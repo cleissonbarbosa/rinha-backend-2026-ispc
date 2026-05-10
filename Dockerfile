@@ -16,7 +16,7 @@ COPY src/knn.ispc src/
 
 RUN /opt/ispc/bin/ispc src/knn.ispc \
     --arch=x86-64 \
-    --target=avx2-i32x16 \
+    --target=avx2-i32x8 \
     --cpu=haswell \
     --PIC \
     --opt=fast-math \
@@ -35,14 +35,7 @@ ARG ENABLE_PROFILER=0
 
 WORKDIR /build
 
-RUN apk add --no-cache ca-certificates curl gzip tar wget xz
-
-RUN wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz && \
-    tar xf zig-linux-x86_64-0.13.0.tar.xz && \
-    mv zig-linux-x86_64-0.13.0 /usr/local/zig && \
-    ln -s /usr/local/zig/zig /usr/local/bin/zig && \
-    rm zig-linux-x86_64-0.13.0.tar.xz
-
+RUN apk add --no-cache ca-certificates curl gzip tar wget xz zig
 
 COPY tools/preprocess.nim tools/
 COPY data/ data/

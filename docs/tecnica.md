@@ -1,28 +1,30 @@
 # Documentação Técnica
 
-Este documento concentra os detalhes de arquitetura, preprocessamento e hot path da busca vetorial.
+Este documento resume a arquitetura, o pipeline de dados e o hot path da busca vetorial desta submissão para a Rinha de Backend 2026.
 
 ## Topologia
 
 ```mermaid
 flowchart LR
-  client["cliente / k6"] --> lb["HAProxy<br/>porta 9999<br/>0.20 CPU / 50 MB"]
-  lb --> api1["api1<br/>Zig<br/>0.40 CPU / 150 MB"]
-  lb --> api2["api2<br/>Zig<br/>0.40 CPU / 150 MB"]
+  client["cliente / k6"] --> lb["LB C + epoll<br/>porta 9999<br/>0.40 CPU / 50 MB"]
+  lb -->|Unix socket| api1["api1<br/>Zig + io_uring<br/>0.30 CPU / 150 MB"]
+  lb -->|Unix socket| api2["api2<br/>Zig + io_uring<br/>0.30 CPU / 150 MB"]
   api1 --> mm["mmap read-only<br/>page cache compartilhado"]
   api2 --> mm
   mm --> bins["vectors.bin<br/>labels.bin<br/>residuals.bin<br/>ivf.bin"]
 ```
 
-Orçamento total da composição atual: `1.0 CPU` e `350 MB`.
+Orçamento total: `1.0 CPU` e `350 MB`.
 
-## Fluxo da requisição
+O load balancer é um proxy C mínimo com `epoll`, round-robin e backend via Unix sockets. As APIs rodam um worker de I/O cada (`IO_BACKEND=uring`, `HTTP_THREADS=1`), evitando contenção dentro do limite de `0.30 CPU` por instância.
+
+## Fluxo da Requisição
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant C as Cliente
-  participant H as HAProxy
+  participant L as LB C
   participant A as API Zig
   participant J as json_fast
   participant V as vectorize
@@ -30,36 +32,39 @@ sequenceDiagram
   participant I as ISPC
   participant D as mmap bins
 
-  C->>H: POST /fraud-score
-  H->>A: round-robin
+  C->>L: POST /fraud-score
+  L->>A: Unix socket
   A->>J: parse do body
   J-->>A: Payload
-  A->>V: vetor normalizado de 14 dimensões
+  A->>V: vetor normalizado 14D
   V-->>A: query[14]
   A->>X: vc_query(query)
-  X->>D: centroides, listas e labels
-  X->>I: centroid distance + q16 scan
-  X-->>A: contagem de fraudes no top-K
+  X->>D: centroides, boundaries, labels e residuals
+  X->>I: probes + top-k coarse
+  X-->>A: contagem de fraudes no top-5
   A-->>C: approved + fraud_score
 ```
 
-O servidor expõe dois endpoints:
+Endpoints:
 
-- `GET /ready` para readiness depois do carregamento dos binários.
-- `POST /fraud-score` para classificar a transação.
+- `GET /ready`
+- `POST /fraud-score`
 
-## Componentes principais
+## Componentes
 
 | Arquivo | Responsabilidade |
 | --- | --- |
-| `src/main.zig` | servidor HTTP, roteamento, carregamento dos bins e montagem da resposta |
-| `src/json_fast.zig` | parser JSON manual sem alocação no hot path |
-| `src/vectorize.zig` | vetorização de 14 features e regra final `approved/fraud_score` |
-| `src/vector_core.zig` | consulta ao índice IVF, shortlist coarse, expansão por raio e rerank refinado |
-| `src/knn.ispc` | kernels SIMD para distância a centroides e scan q16 |
-| `tools/preprocess.nim` | geração do índice binário no build da imagem |
+| `lb/lb.c` | load balancer C com `epoll`, round-robin e Unix sockets |
+| `src/main.zig` | startup, carregamento dos bins, listeners TCP/Unix e seleção do backend de I/O |
+| `src/io_server.zig` | servidor `io_uring` usado no caminho da competição |
+| `src/dispatch.zig` | parsing HTTP, roteamento e instrumentação opcional de profiler |
+| `src/json_fast.zig` | parser JSON manual sem heap allocation no hot path |
+| `src/vectorize.zig` | normalização das 14 features da transação |
+| `src/vector_core.zig` | consulta IVF, expansão por raio, shortlist e rerank refinado |
+| `src/knn.ispc` | kernels SIMD AVX2 para probes, ranges e top-k coarse |
+| `tools/preprocess.nim` | geração dos arquivos binários usados em runtime |
 
-## Pipeline de build e dados
+## Pipeline de Dados
 
 ```mermaid
 flowchart LR
@@ -74,57 +79,64 @@ flowchart LR
   i --> image
 ```
 
-Comportamento atual do build:
+Comportamento do build:
 
-- por padrão, o `Dockerfile` baixa `references.json.gz` do repositório oficial e regenera o índice;
-- se `USE_LOCAL_DATA=1` e os arquivos em `data/*.bin` existirem, a imagem reutiliza os binários locais;
-- a compilação usa `-Dcpu=haswell` e linka `knn_ispc.o` com `-Dispc-object`.
+- por padrão, `USE_LOCAL_DATA=1` reaproveita `data/*.bin` quando os arquivos existem;
+- sem dados locais, o build baixa `references.json.gz` do repositório oficial e gera os bins;
+- o ISPC compila `src/knn.ispc` com `--target=avx2-i32x8`, `--cpu=haswell` e `--opt=fast-math`;
+- o Zig linka o objeto ISPC via `-Dispc-object=/tmp/knn_ispc.o`.
 
-## Índice vetorial
+## Hot Path da Busca
 
-O índice combina coarse search com refinamento curto:
+O índice usa IVF quantizado com shortlist coarse e rerank refinado:
 
-1. a query é quantizada para `i16`;
-2. o core mede a distância para todos os centroides IVF;
-3. os `nprobe` clusters mais próximos são varridos primeiro;
-4. a shortlist coarse é expandida quando o raio de um cluster ainda permite um candidato melhor;
-5. os melhores candidatos passam por rerank com `residuals.bin`.
+1. a query 14D é quantizada para `i16` e também para a escala refinada;
+2. `vc_centroid_dists_top_soa_ispc` calcula as distâncias dos centroides em layout SoA e seleciona os `nprobe` clusters na mesma passada;
+3. `vc_scan_ranges_top_q16_ispc` varre todos os clusters seed em uma chamada e retorna o top-16 global coarse;
+4. quando necessário, a expansão por raio varre clusters extras com `vc_scan_top_q16_ispc`;
+5. os `TOP_C` candidatos passam por rerank usando `residuals.bin`;
+6. o top-5 final define `fraud_score`.
 
 ```mermaid
 flowchart TD
-  q["query 14D"] --> q16["quantização q16"]
-  q16 --> cdist["distância aos centroides"]
-  cdist --> probe["seleção dos clusters nprobe"]
-  probe --> coarse["scan SoA quantizado"]
-  coarse --> expand["expansão por raio"]
-  expand --> topc["shortlist TOP_C"]
+  q["query 14D"] --> q16["quantização q16 + refinada"]
+  q16 --> ctop["ISPC: centroides + seleção nprobe"]
+  ctop --> seed["ISPC: multi-range seed top-16"]
+  seed --> expand{"expansão por raio?"}
+  expand -->|sim| extra["ISPC: range extra top-16"]
+  expand -->|não| topc["shortlist TOP_C"]
+  extra --> topc
   topc --> refine["rerank com residual int8"]
   refine --> topk["K = 5"]
   topk --> resp["approved + fraud_score"]
 ```
 
-Esse desenho reduz o número de vetores escaneados sem abrir mão do refinamento fino nos casos em que o coarse sozinho empata ou fica perto de empatar.
+A principal mudança de performance foi evitar materializar distâncias demais e evitar top-k escalar em Zig no caminho seed. O kernel ISPC agora devolve apenas os melhores candidatos coarse relevantes.
 
-## Parâmetros atuais
+## Parâmetros Atuais
 
-| Parâmetro | Valor atual | Onde |
+| Parâmetro | Valor | Onde |
 | --- | --- | --- |
-| Dimensão do vetor | `14` | `src/vectorize.zig` |
+| Dimensão do vetor | `14` | `src/vectorize.zig` / `src/vector_core.zig` |
 | `K` final | `5` | `src/vector_core.zig` |
-| Shortlist coarse | `TOP_C = 16` | `src/vector_core.zig` |
+| Shortlist coarse | `TOP_C = 16` | `src/vector_core.zig` / `src/knn.ispc` |
 | Clusters IVF | `8192` | `Dockerfile` |
-| `nprobe` | `8` | `Dockerfile` |
+| `nprobe` | `8` | `Dockerfile` / `data/ivf.bin` |
 | Amostra do k-means | `65536` | `Dockerfile` |
 | Iterações do k-means | `25` | `Dockerfile` |
-| Worker threads na stack | `2` por API | `docker-compose.yml` |
-| CPU target | `haswell` | `Dockerfile` / `build.zig` |
+| API workers | `1` por API | `docker-compose.yml` |
+| API CPU | `0.30` por instância | `docker-compose.yml` |
+| LB CPU | `0.40` | `docker-compose.yml` |
+| ISPC target | `avx2-i32x8` | `Dockerfile` |
+| CPU target Zig | `haswell` | `Dockerfile` / `build.zig` |
 
-Detalhes relevantes da implementação:
+Detalhes relevantes:
 
-- `vectors.bin` usa layout SoA quantizado em `i16`, organizado por cluster;
-- `residuals.bin` guarda um ajuste `int8` por dimensão para o rerank refinado;
-- `ivf.bin` contém magic, metadados, centroides, raios e limites das listas invertidas;
-- o `mmap` faz pre-fault das páginas no startup para reduzir latência fria.
+- `vectors.bin` usa layout SoA em `i16`, organizado por cluster;
+- `centroids_soa_buf` é montado no startup para evitar gathers no scan de centroides;
+- `scratch_*` global é seguro porque cada container usa um worker HTTP;
+- `mmap` faz pre-fault das páginas no startup para reduzir latência fria;
+- o profiler compila para no-op no build normal e só é ligado por `make profile`.
 
 ## Vetorização
 
@@ -137,7 +149,7 @@ As 14 features combinam sinal transacional, contexto temporal e perfil do mercha
 - flags `is_online`, `card_present` e merchant conhecido;
 - risco por MCC e ticket médio do merchant.
 
-As saídas seguem a regra de maioria simples sobre o top-5:
+As saídas seguem a maioria simples no top-5:
 
 ```mermaid
 flowchart LR
@@ -151,7 +163,7 @@ flowchart LR
 
 ## Trade-offs
 
-- O parser manual evita DOM JSON e heap allocation por request, mas aumenta a rigidez do contrato de entrada.
-- A expansão por raio custa mais do que uma ANN agressiva, mas melhora a chance de manter o top-K correto.
-- O refinamento com residual adiciona memória ao dataset, porém reduz erro de ordenação nos casos de borda.
-- O uso de `mmap` read-only simplifica o startup da aplicação e deixa o kernel compartilhar páginas entre `api1` e `api2`.
+- O parser manual e a resposta pré-formatada reduzem latência, mas assumem o contrato de payload da competição.
+- O IVF com expansão por raio é mais caro que uma ANN agressiva, mas preserva acurácia perfeita no teste oficial local.
+- A seleção top-k dentro do ISPC reduz tráfego de memória e trabalho escalar no Zig, ao custo de kernels mais específicos.
+- O uso de Unix sockets reduz overhead entre LB e APIs, mas acopla a stack ao ambiente Linux da competição.

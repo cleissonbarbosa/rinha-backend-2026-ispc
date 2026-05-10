@@ -1,7 +1,9 @@
 const std = @import("std");
-const json_fast = @import("json_fast.zig");
+const linux = std.os.linux;
+const dispatch = @import("dispatch.zig");
+const io_server = @import("io_server.zig");
 const profiler = @import("profiler.zig");
-const vectorize = @import("vectorize.zig");
+const responses = @import("responses.zig");
 const vector_core = @import("vector_core.zig");
 
 var ready: bool = false;
@@ -26,225 +28,129 @@ fn loadData(data_dir: []const u8) !void {
     std.log.info("Data loaded: {d} indexed vectors", .{vector_core.vc_count()});
 }
 
-const RECV_BUF_SIZE = 8192;
-const MAX_BODY_SIZE = 4096;
+const RECV_BUF_SIZE: usize = 8192;
 const DEFAULT_WORKER_COUNT: usize = 4;
+const LISTEN_BACKLOG: u31 = 4096;
 
-// Pre-formatted responses
-const RESP_OK = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-const RESP_503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nLoading";
-const RESP_400 = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request";
-const RESP_404 = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-const RESP_FALLBACK = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}";
-const RESP_FRAUD_SCORES = [_][]const u8{
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
-};
+fn openTcpListener(port: u16) !i32 {
+    const fd = try std.posix.socket(
+        linux.AF.INET,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        linux.IPPROTO.TCP,
+    );
+    errdefer std.posix.close(fd);
 
-const Route = enum {
-    ready,
-    fraud_score,
-    unknown,
-};
+    const one: c_int = 1;
+    try std.posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one));
+    try std.posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one));
+    try std.posix.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&one));
 
-const ReadRequestResult = union(enum) {
-    complete: []const u8,
-    bad_request: void,
-    closed: void,
-};
-
-fn writeResponse(stream: std.net.Stream, response: []const u8) void {
-    stream.writeAll(response) catch {};
+    const addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = 0,
+    };
+    try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+    try std.posix.listen(fd, LISTEN_BACKLOG);
+    return fd;
 }
 
-fn findHeaderEnd(request: []const u8) ?usize {
-    if (request.len < 4) return null;
-
-    var i: usize = 0;
-    while (i + 3 < request.len) : (i += 1) {
-        if (request[i] == '\r' and request[i + 1] == '\n' and request[i + 2] == '\r' and request[i + 3] == '\n') {
-            return i + 4;
-        }
+fn openUnixListener(path: []const u8) !i32 {
+    if (std.fs.path.dirname(path)) |dir| {
+        std.fs.cwd().makePath(dir) catch {};
     }
+    std.fs.deleteFileAbsolute(path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    };
 
-    return null;
+    const fd = try std.posix.socket(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+    );
+    errdefer std.posix.close(fd);
+
+    var addr: linux.sockaddr.un = .{ .path = std.mem.zeroes([108]u8) };
+    if (path.len >= addr.path.len) return error.SocketPathTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    addr.path[path.len] = 0;
+    const addrlen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+    try std.posix.bind(fd, @ptrCast(&addr), addrlen);
+
+    try std.posix.listen(fd, LISTEN_BACKLOG);
+    return fd;
 }
 
-fn parseContentLength(request: []const u8, header_end: usize) usize {
-    const tag = "content-length:";
-    if (header_end <= tag.len) return 0;
-
-    var i: usize = 0;
-    while (i + tag.len < header_end) : (i += 1) {
-        const line_start = i == 0 or (i >= 2 and request[i - 2] == '\r' and request[i - 1] == '\n');
-        if (!line_start) continue;
-
-        var matches = true;
-        for (tag, 0..) |expected, offset| {
-            var actual = request[i + offset];
-            if (actual >= 'A' and actual <= 'Z') actual |= 0x20;
-            if (actual != expected) {
-                matches = false;
-                break;
-            }
-        }
-
-        if (!matches) continue;
-
-        var cursor = i + tag.len;
-        while (cursor < header_end and (request[cursor] == ' ' or request[cursor] == '\t')) : (cursor += 1) {}
-
-        var value: usize = 0;
-        while (cursor < header_end and request[cursor] >= '0' and request[cursor] <= '9') : (cursor += 1) {
-            value = (value * 10) + (request[cursor] - '0');
-        }
-
-        return value;
-    }
-
-    return 0;
-}
-
-fn readRequest(stream: std.net.Stream, recv_buf: []u8) ReadRequestResult {
-    var used: usize = 0;
-
-    while (used < recv_buf.len) {
-        const n_read = stream.read(recv_buf[used..]) catch return .closed;
-        if (n_read == 0) return if (used == 0) .closed else .bad_request;
-        used += n_read;
-
-        const header_end = findHeaderEnd(recv_buf[0..used]) orelse continue;
-        const body_len = parseContentLength(recv_buf[0..used], header_end);
-        if (body_len > MAX_BODY_SIZE) return .bad_request;
-
-        const total_len = header_end + body_len;
-        if (total_len > recv_buf.len) return .bad_request;
-        if (used >= total_len) return .{ .complete = recv_buf[0..total_len] };
-    }
-
-    return .bad_request;
-}
-
-fn routeRequest(request: []const u8) Route {
-    if (request.len >= 18 and std.mem.startsWith(u8, request, "POST /fraud-score ")) return .fraud_score;
-    if (request.len >= 11 and std.mem.startsWith(u8, request, "GET /ready ")) return .ready;
-    return .unknown;
-}
-
-fn handleConnection(stream: std.net.Stream) void {
+fn handleThreadedConnection(stream: std.net.Stream) void {
     defer stream.close();
 
-    var request_scope = profiler.Scope.start();
     var recv_buf: [RECV_BUF_SIZE]u8 = undefined;
+    var used: usize = 0;
+    const ctx = dispatch.Context{ .set = &responses.close_set, .ready = ready };
 
-    const request = switch (readRequest(stream, &recv_buf)) {
-        .closed => return,
-        .bad_request => {
-            writeResponse(stream, RESP_400);
-            return;
-        },
-        .complete => |complete| complete,
-    };
-
-    switch (routeRequest(request)) {
-        .ready => {
-            writeResponse(stream, if (ready) RESP_OK else RESP_503);
-        },
-        .fraud_score => {
-            handleFraudScore(request, stream, &request_scope);
-        },
-        .unknown => {
-            writeResponse(stream, RESP_404);
-        },
-    }
-}
-
-fn finishFraudResponse(stream: std.net.Stream, response: []const u8, request_scope: *profiler.Scope) void {
-    writeResponse(stream, response);
-    request_scope.lap(.write_response);
-    request_scope.finish(.fraud_total);
-}
-
-fn handleFraudScore(request: []const u8, stream: std.net.Stream, request_scope: *profiler.Scope) void {
-    request_scope.lap(.read_request);
-
-    const body = findBody(request) orelse {
-        request_scope.lap(.find_body);
-        finishFraudResponse(stream, RESP_FALLBACK, request_scope);
-        return;
-    };
-    request_scope.lap(.find_body);
-
-    const payload = json_fast.parse(body) orelse {
-        request_scope.lap(.parse_json);
-        finishFraudResponse(stream, RESP_FALLBACK, request_scope);
-        return;
-    };
-    request_scope.lap(.parse_json);
-
-    const query_vec = vectorize.vectorize(&payload);
-    request_scope.lap(.vectorize);
-
-    const max_score: c_int = @intCast(RESP_FRAUD_SCORES.len);
-    const raw_count = vector_core.vc_query(query_vec[0..].ptr);
-    const fraud_count: usize = if (raw_count < 0 or raw_count >= max_score) 0 else @intCast(raw_count);
-    request_scope.lap(.core_query);
-
-    finishFraudResponse(stream, RESP_FRAUD_SCORES[fraud_count], request_scope);
-}
-
-fn findBody(request: []const u8) ?[]const u8 {
-    const header_end = findHeaderEnd(request) orelse return null;
-    return request[header_end..];
-}
-
-fn runWorker(server: *std.net.Server) !void {
     while (true) {
-        const conn = server.accept() catch |err| switch (err) {
-            error.ConnectionAborted => continue,
-            else => return err,
-        };
+        const n = stream.read(recv_buf[used..]) catch return;
+        if (n == 0) return;
+        used += n;
 
-        handleConnection(conn.stream);
+        switch (dispatch.process(recv_buf[0..used], ctx)) {
+            .response => |resp| {
+                _ = stream.writeAll(resp) catch {};
+                return;
+            },
+            .need_more => {
+                if (used >= recv_buf.len) {
+                    _ = stream.writeAll(ctx.set.bad_request) catch {};
+                    return;
+                }
+            },
+        }
     }
 }
 
-fn workerMain(server: *std.net.Server) void {
-    runWorker(server) catch |err| {
-        std.log.err("worker stopped: {any}", .{err});
-    };
-}
+fn threadedWorkerLoop(listen_fd: i32) void {
+    while (true) {
+        var addr: linux.sockaddr = undefined;
+        var addrlen: linux.socklen_t = @sizeOf(linux.sockaddr);
+        const fd_res = linux.accept4(listen_fd, &addr, &addrlen, linux.SOCK.CLOEXEC);
+        const fd_signed: i32 = @intCast(@as(isize, @bitCast(fd_res)));
+        if (fd_signed < 0) continue;
 
-fn listenTcpServer(port: u16) !std.net.Server {
-    const address = std.net.Address.parseIp4("0.0.0.0", port) catch unreachable;
-    return address.listen(.{
-        .reuse_address = true,
-        .kernel_backlog = 4096,
-    });
-}
-
-fn listenUnixServer(socket_path: []const u8) !std.net.Server {
-    if (std.fs.path.dirname(socket_path)) |socket_dir| {
-        try std.fs.cwd().makePath(socket_dir);
+        const stream = std.net.Stream{ .handle = fd_signed };
+        handleThreadedConnection(stream);
     }
+}
 
-    std.fs.deleteFileAbsolute(socket_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
+fn runThreaded(listen_fd: i32, worker_count: usize) !void {
+    var spawned: usize = 1;
+    while (spawned < worker_count) : (spawned += 1) {
+        const thread = try std.Thread.spawn(.{}, threadedWorkerLoop, .{listen_fd});
+        thread.detach();
+    }
+    threadedWorkerLoop(listen_fd);
+}
+
+const Backend = enum { uring, threaded };
+
+fn pickBackend() Backend {
+    const env = std.posix.getenv("IO_BACKEND") orelse return .uring;
+    if (std.mem.eql(u8, env, "threaded")) return .threaded;
+    if (std.mem.eql(u8, env, "uring")) return .uring;
+    return .uring;
+}
+
+fn ignoreSigpipe() void {
+    const act = linux.Sigaction{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = linux.empty_sigset,
+        .flags = 0,
     };
-
-    const address = try std.net.Address.initUnix(socket_path);
-    return address.listen(.{
-        .kernel_backlog = 4096,
-    });
+    _ = linux.sigaction(linux.SIG.PIPE, &act, null);
 }
 
 pub fn main() !void {
     profiler.initFromEnv();
+    ignoreSigpipe();
 
     const port: u16 = blk: {
         const port_str = std.posix.getenv("PORT") orelse "8080";
@@ -258,58 +164,47 @@ pub fn main() !void {
         break :blk @max(parsed, 1);
     };
 
+    const backend = pickBackend();
+
     if (socket_path) |path| {
-        std.log.info("Starting rinha-server on socket {s}, data_dir={s}, workers={d}", .{ path, data_dir, worker_count });
+        std.log.info("Starting rinha-server backend={s} socket={s} data_dir={s}", .{ @tagName(backend), path, data_dir });
     } else {
-        std.log.info("Starting rinha-server on port {d}, data_dir={s}, workers={d}", .{ port, data_dir, worker_count });
+        std.log.info("Starting rinha-server backend={s} port={d} data_dir={s}", .{ @tagName(backend), port, data_dir });
     }
 
-    // Load preprocessed data
     loadData(data_dir) catch |err| {
         std.log.err("Failed to load data: {any}", .{err});
         return err;
     };
 
     ready = true;
-    if (socket_path) |path| {
-        std.log.info("Server ready on socket {s}", .{path});
-    } else {
-        std.log.info("Server ready on port {d}", .{port});
-    }
 
-    var server = if (socket_path) |path|
-        try listenUnixServer(path)
+    const listen_fd: i32 = if (socket_path) |p|
+        try openUnixListener(p)
     else
-        try listenTcpServer(port);
-    defer server.deinit();
-    defer if (socket_path) |path| {
-        std.fs.deleteFileAbsolute(path) catch {};
+        try openTcpListener(port);
+    defer std.posix.close(listen_fd);
+    defer if (socket_path) |p| {
+        std.fs.deleteFileAbsolute(p) catch {};
     };
 
-    var spawned_threads: usize = 1;
-    while (spawned_threads < worker_count) : (spawned_threads += 1) {
-        const thread = try std.Thread.spawn(.{}, workerMain, .{&server});
-        thread.detach();
+    switch (backend) {
+        .uring => {
+            io_server.run(listen_fd, &ready) catch |err| {
+                std.log.err("io_uring transport failed ({any}); falling back to threaded", .{err});
+                try runThreaded(listen_fd, worker_count);
+            };
+        },
+        .threaded => {
+            try runThreaded(listen_fd, worker_count);
+        },
     }
-
-    try runWorker(&server);
-}
-
-test "findBody basic" {
-    const req = "POST /fraud-score HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
-    const body = findBody(req);
-    try std.testing.expect(body != null);
-    try std.testing.expectEqualStrings("hello", body.?);
-}
-
-test "findBody no body" {
-    const req = "GET /ready HTTP/1.1\r\n";
-    try std.testing.expect(findBody(req) == null);
 }
 
 test {
-    // Run all imported module tests
     _ = @import("time_utils.zig");
     _ = @import("vectorize.zig");
     _ = @import("json_fast.zig");
+    _ = @import("dispatch.zig");
+    _ = @import("io_server.zig");
 }
