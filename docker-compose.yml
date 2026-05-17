@@ -1,6 +1,6 @@
 services:
   lb:
-    image: cleissonb/rinha-backend-2026-ispc-lb:v0.2.0
+    image: cleissonb/rinha-backend-2026-ispc-lb:v0.2.1
     environment:
       BACKEND1: unix:/sockets/api1.sock
       BACKEND2: unix:/sockets/api2.sock
@@ -24,13 +24,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.16"
+          cpus: "0.20"
           memory: "50MB"
     networks:
       - rinha
 
   api1:
-    image: cleissonb/rinha-backend-2026-ispc:v0.2.0
+    image: cleissonb/rinha-backend-2026-ispc:v0.2.1
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api1
     environment:
@@ -52,13 +52,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
+          cpus: "0.40"
           memory: "150MB"
     networks:
       - rinha
 
   api2:
-    image: cleissonb/rinha-backend-2026-ispc:v0.2.0
+    image: cleissonb/rinha-backend-2026-ispc:v0.2.1
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api2
     depends_on:
@@ -82,7 +82,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
+          cpus: "0.40"
           memory: "150MB"
     networks:
       - rinha
