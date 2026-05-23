@@ -1,6 +1,6 @@
 services:
   lb:
-    image: cleissonb/rinha-backend-2026-ispc-lb:v0.2.0
+    image: cleissonb/rinha-backend-2026-ispc-lb:v0.3.0
     environment:
       BACKEND1: unix:/sockets/api1.sock
       BACKEND2: unix:/sockets/api2.sock
@@ -28,7 +28,7 @@ services:
       - rinha
 
   api1:
-    image: cleissonb/rinha-backend-2026-ispc:v0.2.0
+    image: cleissonb/rinha-backend-2026-ispc:v0.3.0
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api1
     environment:
@@ -54,7 +54,7 @@ services:
       - rinha
 
   api2:
-    image: cleissonb/rinha-backend-2026-ispc:v0.2.0
+    image: cleissonb/rinha-backend-2026-ispc:v0.3.0
     command: ["/bin/sh", "-lc", "umask 000 && exec /app/rinha-server"]
     hostname: api2
     depends_on:
